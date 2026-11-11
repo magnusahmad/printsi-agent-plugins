@@ -3,9 +3,15 @@
   "mcpServers": {
     "printsi": {
       "type": "stdio",
-      "command": "npx",
-      "args": ["-y", "printsi@0.2.1", "mcp"],
-      "env": { "PRINTSI_CONFIG_DIR": "${PLUGIN_DATA}/printsi", "PRINTSI_TELEMETRY": "0" }
+      "command": "node",
+      "args": [
+        "${PLUGIN_ROOT}/server/printsi.mjs",
+        "mcp"
+      ],
+      "env": {
+        "PRINTSI_CONFIG_DIR": "${PLUGIN_DATA}/printsi",
+        "PRINTSI_TELEMETRY": "0"
+      }
     }
   }
 }

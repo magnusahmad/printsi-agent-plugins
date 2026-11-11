@@ -53,7 +53,9 @@ print and export it with this skill's script; don't hand a printer a screenshot 
 ## 2. Check, quote and order (printsi tools)
 
 1. **Check the file first** (free; creates no order): `check` with the PDF path, `product` and `size` (e.g. flyer, 8.5x11).
-   Fix every `error` issue in the source and export again; printsi never edits artwork. Mention warnings. If a check is
+   The result includes the page preview as an image, with trim, safe area and each issue marked: look at it before
+   deciding what to change. Fix every `error` issue in the source and export again; printsi never edits artwork.
+   Mention warnings. In Hermes Desktop the printsi pane shows the same page and issues to the user. If a check is
    still running, run the `resume` command it returns: it has the original options, so the result matches this check.
 2. **Ask what's offered** when unsure: `products_show` with `region` (US) and `qty` says whether a quantity is
    offered and names the nearest ones. Never round a quantity yourself.
