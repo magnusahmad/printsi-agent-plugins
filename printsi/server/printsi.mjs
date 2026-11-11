@@ -21346,7 +21346,7 @@ function optionValues(flags) {
   const options = {};
   for (const key of OPTION_FLAGS) {
     const v = flags[key];
-    if (typeof v === "string") options[key] = v;
+    if (typeof v === "string") options[key] = v.trim().toLowerCase();
   }
   const generic = flags.option;
   for (const pair of Array.isArray(generic) ? generic : []) {
@@ -21356,7 +21356,7 @@ function optionValues(flags) {
         param: "--option"
       });
     }
-    options[pair.slice(0, eq)] = pair.slice(eq + 1);
+    options[pair.slice(0, eq).trim().toLowerCase()] = pair.slice(eq + 1).trim().toLowerCase();
   }
   return options;
 }
@@ -21714,16 +21714,22 @@ async function callTool(name, args, opts) {
     ...opts.vars,
     [`${BRAND.envPrefix}NO_UPDATE_NOTICE`]: "1"
   });
-  const envelope = withTools(result.envelope);
+  const envelope = localPreviews(withTools(result.envelope));
+  const images = tool.name === "check" ? await previewImages(envelope) : [];
+  const note = images.length > 0 ? "\nThe page preview is attached as an image (trim, safe area and each issue are marked on it). Look at the attached image; there is no URL to open." : "";
   return {
-    content: [
-      { type: "text", text: modelText(envelope) },
-      ...tool.name === "check" ? await previewImages(envelope) : []
-    ],
+    content: [{ type: "text", text: modelText(envelope) + note }, ...images],
     structuredContent: envelope,
     isError: !envelope.ok,
     resultType: "complete"
   };
+}
+function localPreviews(envelope) {
+  const data = envelope.ok ? envelope.data : void 0;
+  const previews = data?.check?.previews;
+  if (!envelope.ok || !data?.check || !Array.isArray(previews) || !previews.some((p) => p.local_path)) return envelope;
+  const local = previews.map(({ url: _url2, ...rest }) => rest);
+  return { ...envelope, data: { ...data, check: { ...data.check, previews: local } } };
 }
 var MAX_PREVIEW_PAGES = 2;
 var MAX_PREVIEW_BYTES = 3 * 1024 * 1024;
