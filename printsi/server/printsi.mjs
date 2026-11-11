@@ -20228,6 +20228,7 @@ async function checkUploaded(settings, input2, path, { bytes, sha256 }, deadline
     envelope = await expectOk(
       await apiRequest(settings, { path: `/v1/checks/${check2.id}`, query: query(0), deadline })
     );
+    check2 = envelope.data.check;
   }
   let nextActions = envelope.next_actions;
   if (check2.status === "queued" || check2.status === "running") {

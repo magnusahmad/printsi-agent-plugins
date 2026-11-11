@@ -27,33 +27,29 @@ function printsiTool(name) {
   return match ? match[1] : null
 }
 
+/** JSON from a string, also when Hermes has wrapped it in its untrusted-result notice. */
 function parse(value) {
   if (typeof value !== 'string') {
     return value && typeof value === 'object' ? value : null
   }
 
-  try {
-    const parsed = JSON.parse(value)
+  const tryParse = source => {
+    try {
+      const parsed = JSON.parse(source)
 
-    return parsed && typeof parsed === 'object' ? parsed : null
-  } catch {
-    return null
+      return parsed && typeof parsed === 'object' ? parsed : null
+    } catch {
+      return null
+    }
   }
+  const first = value.indexOf('{')
+  const last = value.lastIndexOf('}')
+
+  return tryParse(value) ?? (first >= 0 && last > first ? tryParse(value.slice(first, last + 1)) : null)
 }
 
-/**
- * The printsi envelope ({ ok, data }) from a tool result. Hermes hands an MCP result over as
- * `{ result: <text>, structuredContent: <envelope> }` (an object or its JSON string), or, when the
- * call returned images to a vision model, wrapped as `{ _multimodal, text_summary }`. If the
- * structured half is missing, the data is the last line of the text, which the server writes as JSON.
- */
-function envelopeOf(result) {
-  let value = parse(result)
-
-  if (value?._multimodal) {
-    value = parse(value.text_summary) ?? parse(value.content?.[0]?.text)
-  }
-
+/** The envelope inside one parsed MCP result: `{ result: <text>, structuredContent: <envelope> }`. */
+function envelopeIn(value) {
   if (!value) {
     return null
   }
@@ -69,10 +65,37 @@ function envelopeOf(result) {
   }
 
   if (typeof value.result === 'string') {
+    // The structured half is missing: the server writes the data as the last JSON line of the text.
     const lines = value.result.split('\n').filter(line => line.startsWith('{'))
     const data = parse(lines[lines.length - 1])
 
     return data && (data.check || data.order) ? { ok: true, data } : null
+  }
+
+  return null
+}
+
+/**
+ * The printsi envelope ({ ok, data }) from a tool result. Hermes hands an MCP result over as an
+ * object or its JSON string. When the call returned images to a vision model, the result is
+ * instead `{ _multimodal, content: [text parts, images], text_summary }`, and the text may carry
+ * Hermes's untrusted-result notice around the JSON.
+ */
+function envelopeOf(result) {
+  const value = parse(result)
+
+  if (!value?._multimodal) {
+    return envelopeIn(value)
+  }
+
+  const texts = [value.text_summary, ...(Array.isArray(value.content) ? value.content.map(part => part?.text) : [])]
+
+  for (const candidate of texts) {
+    const found = typeof candidate === 'string' ? envelopeIn(parse(candidate)) : null
+
+    if (found) {
+      return found
+    }
   }
 
   return null
@@ -256,6 +279,10 @@ function Dot({ color, size = 7 }) {
 // ---------------------------------------------------------------------------------------------------
 
 function verdict(check) {
+  if (check.unread) {
+    return { color: C.faint, title: 'Checked', detail: 'The result is in the chat.' }
+  }
+
   if (check.status && check.status !== 'complete') {
     return { color: C.faint, title: 'Checking…', detail: 'The check is still running.' }
   }
@@ -764,12 +791,44 @@ export default {
       ctx.storage.set('state', $state.get())
     }
 
+    /** A check that is running, or one whose result could not be read: never an older verdict. */
+    const placeholder = (args, extra) => ({
+      id: `pending-${Date.now()}`,
+      file: text(args?.pdf).split(/[\\/]/).pop() ?? '',
+      pages: 1,
+      product: text(args?.product),
+      size: text(String(args?.size ?? '')).toLowerCase(),
+      sides: null,
+      status: 'running',
+      result: '',
+      errors: 0,
+      warnings: 0,
+      checksRun: 0,
+      preview: null,
+      issues: [],
+      at: Date.now(),
+      ...extra
+    })
+
+    ctx.onEvent('tool.start', event => {
+      const payload = event?.payload ?? {}
+
+      if (printsiTool(payload.name) === 'check') {
+        update({ check: placeholder(payload.args) })
+      }
+    })
+
     ctx.onEvent('tool.complete', event => {
       const payload = event?.payload ?? {}
       const tool = printsiTool(payload.name)
       const envelope = tool ? envelopeOf(payload.result) : null
 
       if (!envelope || envelope.ok !== true || !envelope.data) {
+        // A check that failed to run, or a result this pane could not read: clear the old verdict.
+        if (tool === 'check' && $state.get().check?.status === 'running') {
+          update({ check: envelope && envelope.ok === false ? null : placeholder(payload.args, { status: 'complete', unread: true }) })
+        }
+
         return
       }
 
