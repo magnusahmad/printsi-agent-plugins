@@ -76,13 +76,61 @@ function envelopeIn(value) {
 }
 
 /**
+ * The envelope from the cut-off start of a larger JSON document. Desktop caps a tool result in the
+ * event at 64 KB; a result with an attached preview image is larger, so the event carries
+ * `{ output: <the first 32 KB of the result's JSON>, truncated: true }`. The envelope is a few KB
+ * and sits in the first text part, complete, as a JSON string literal: decode each complete string
+ * literal in the fragment and take the first that holds an envelope.
+ */
+function envelopeInFragment(fragment) {
+  let at = fragment.indexOf('"')
+
+  while (at >= 0) {
+    let end = at + 1
+
+    while (end < fragment.length && fragment[end] !== '"') {
+      end += fragment[end] === '\\' ? 2 : 1
+    }
+
+    if (end >= fragment.length) {
+      return null
+    }
+
+    // Only a long literal can hold an envelope; short ones are keys and labels.
+    if (end - at > 200) {
+      let decoded = null
+
+      try {
+        decoded = JSON.parse(fragment.slice(at, end + 1))
+      } catch {
+        decoded = null
+      }
+
+      const found = typeof decoded === 'string' ? envelopeIn(parse(decoded)) : null
+
+      if (found) {
+        return found
+      }
+    }
+
+    at = fragment.indexOf('"', end + 1)
+  }
+
+  return null
+}
+
+/**
  * The printsi envelope ({ ok, data }) from a tool result. Hermes hands an MCP result over as an
  * object or its JSON string. When the call returned images to a vision model, the result is
- * instead `{ _multimodal, content: [text parts, images], text_summary }`, and the text may carry
- * Hermes's untrusted-result notice around the JSON.
+ * instead `{ _multimodal, content: [text parts, images], text_summary }`, the text may carry
+ * Hermes's untrusted-result notice around the JSON, and Desktop may have cut the whole thing off.
  */
 function envelopeOf(result) {
   const value = parse(result)
+
+  if (value?.truncated === true && typeof (value.output ?? value.error) === 'string') {
+    return envelopeInFragment(value.output ?? value.error)
+  }
 
   if (!value?._multimodal) {
     return envelopeIn(value)
