@@ -1,0 +1,13 @@
+{
+  "name": "printsi",
+  "version": "0.2.2",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsup"
+  },
+  "devDependencies": {
+    "@internal/core": "*",
+    "zod": "4.6.7"
+  }
+}

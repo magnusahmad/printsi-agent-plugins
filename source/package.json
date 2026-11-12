@@ -1,0 +1,19 @@
+{
+  "name": "printsi-server-source",
+  "private": true,
+  "type": "module",
+  "description": "Source of printsi/server/printsi.mjs. `npm ci && npm run build` rebuilds it.",
+  "license": "MIT",
+  "workspaces": [
+    "core",
+    "cli"
+  ],
+  "scripts": {
+    "build": "npm run build -w cli && node build-bundle.mjs"
+  },
+  "devDependencies": {
+    "tsup": "9.0.0",
+    "typescript": "7.0.2",
+    "@types/node": "26.6.6"
+  }
+}

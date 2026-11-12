@@ -40,7 +40,7 @@ button. It needs tool progress to be on (the default) to receive results.
 
 | Path | What it is |
 |---|---|
-| `plugin.json`, `mcp.json` | Portable Agent Plugins v1 manifest. The server is marked `untrusted`, so Hermes asks before every tool that uploads or changes something. |
+| `plugin.json`, `mcp.json` | Portable Agent Plugins v1 manifest. The server is marked `untrusted`, so Hermes asks before every tool that is not read-only. Only tools that send nothing of yours off the machine are marked read-only (`capabilities`, `products_*`, `order_show`, `order_list`, `order_wait`, `order_events`, `ticket_show`, `ticket_list`); `check` (uploads the PDF), `address_validate` and `pickup_points` (send the address) and every tool that changes something ask first. |
 | `server/printsi.mjs` | The MCP server and everything it runs: one readable, unminified JavaScript file, started as `node ${PLUGIN_ROOT}/server/printsi.mjs mcp`. Nothing is downloaded at run time. It is the printsi CLI (also on npm as `printsi`) built into a single file; its only bundled library is zod (see `server/THIRD-PARTY-NOTICES.txt`). |
 | `desktop/plugin.js` | The Desktop pane. Imports only `@hermes/plugin-sdk` and React. |
 | `skills/printsi/` | A short guide for the agent, and two helper scripts for making artwork print-ready. |
@@ -56,7 +56,8 @@ button. It needs tool progress to be on (the default) to receive results.
 - **Network.** The server calls the printsi API at `https://printsi-api-live.magnus-ahmad.workers.dev` and nothing
   else. The optional `qr.sh` script downloads `segno` from PyPI through `uvx`.
 - **Your files.** The PDF you ask it to check or print is uploaded to printsi and stored for the check and the order.
-  A check also saves its page previews to your temporary folder so they can be shown.
+  That PDF is the only file a tool argument can name: an address is passed as an object, never as a file path. A
+  check saves its page previews to a temp folder the server creates; a tool cannot choose where files are written.
 - **Your details.** The delivery name, address, phone and email you give are sent to printsi and to the print supplier
   that makes and ships the order. Order emails go to the address you give.
 - **Money.** The plugin never takes or sees card details and cannot pay on its own. `order_purchase` only returns a

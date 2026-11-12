@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "printsi",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "description": "Check and prepare PDFs for professional printing, or order printed copies for delivery. Free preflight checks bleed, dimensions, safe areas, image resolution, fonts and colour, with previews and issue messages.",
   "author": {
     "name": "printsi"

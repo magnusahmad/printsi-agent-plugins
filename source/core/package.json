@@ -1,0 +1,13 @@
+{
+  "name": "@internal/core",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./pricing": "./src/pricing.ts",
+    "./progress": "./src/progress.ts"
+  },
+  "dependencies": {
+    "zod": "4.6.7"
+  }
+}
