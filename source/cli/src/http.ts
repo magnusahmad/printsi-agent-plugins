@@ -25,7 +25,7 @@ export interface RequestOptions {
  */
 export async function request(settings: Settings, opts: RequestOptions): Promise<Response> {
   const method = opts.method ?? "GET";
-  const doFetch = opts.deps?.fetch ?? fetch;
+  const doFetch = opts.deps?.fetch ?? settings.fetch ?? fetch;
   const sleep = opts.deps?.sleep ?? ((ms: number) => new Promise((r) => setTimeout(r, ms)));
   const url = new URL(/^https?:\/\//.test(opts.path) ? opts.path : `${settings.apiBase}${opts.path}`);
   for (const [k, v] of Object.entries(opts.query ?? {})) url.searchParams.set(k, v);
@@ -97,6 +97,7 @@ export function apiGet(settings: Settings, path: string, query: Record<string, s
 }
 
 function clientHeader(settings: Settings): string {
+  if (settings.client) return settings.client;
   const base = `${BRAND.name}-cli/${CLI_VERSION} node/${process.versions.node}`;
   return settings.telemetry ? `${base} harness=${settings.harness}` : base;
 }

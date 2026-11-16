@@ -179,7 +179,7 @@ export const COMMANDS: Command[] = [
     },
     examples: [
       `${BRAND.name} check flyer.pdf --product flyer --size 8.5x11`,
-      `${BRAND.name} check brochure.pdf --product brochure --size 8.5x11 --fold trifold --preview-dir ./preview`,
+      `${BRAND.name} check brochure.pdf --product brochure --size 16.5x8.5 --fold trifold --preview-dir ./preview`,
     ],
     timeoutS: 120,
     needsNetwork: true,

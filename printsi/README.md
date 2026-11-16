@@ -8,7 +8,7 @@ server that ships in this folder, and gives Hermes Desktop a pane that shows the
 | Step | Tools | What happens |
 |---|---|---|
 | Check the file | `check` | Reads the PDF from your disk, runs a real preflight (bleed, trim size, safe areas, image resolution, fonts, colour) and returns each issue with where it is and how to fix it, plus the page preview as an image. Free; creates no order. |
-| Find what's offered | `capabilities`, `products_list`, `products_show`, `address_validate`, `pickup_points` | Products, sizes, stocks, quantities and where delivery is available. |
+| Find what's offered | `capabilities`, `products_list`, `products_show`, `address_validate`, `pickup_points` | Products, sizes, materials, colours and quantities, the file each product needs, and where delivery is available. |
 | Quote and order | `order_create`, `order_update`, `order_quote` | An unpaid draft with a price for printing, tracked delivery and the service fee, for your address. |
 | Pay | `order_purchase` | Returns a link. You review the order and pay on Stripe's page; the agent never sees a card. The card is held and charged only when the printer accepts the job. |
 | Follow it | `order_show`, `order_list`, `order_wait`, `order_events`, `order_cancel` | Status from accepted to delivered, with tracking. |
@@ -32,9 +32,23 @@ button. It needs tool progress to be on (the default) to receive results.
 
 ## Where and what
 
-- **Delivery:** the contiguous United States and DC.
-- **Products today:** flyers and leaflets (US Letter and Half Letter), on 170 gsm gloss or silk, one or two sides.
-  Other products and regions appear in `products_list` and `capabilities` as they open.
+- **Delivery:** the contiguous United States and DC, tracked. Some products are printed outside the US and come by
+  international courier; the quote gives the delivery dates before anyone pays.
+- **Products:**
+
+  | Kind | Products |
+  |---|---|
+  | Paper and card | Flyers and leaflets, postcards and flat cards, business cards, letterhead, stickers |
+  | Folded | Brochures (half, tri-fold, Z-fold, gate fold and four-panel folds), folded greeting cards and invitations |
+  | Calendars | Wire-bound wall and desk calendars |
+  | Large format | Posters, outdoor posters, vinyl banners with eyelets |
+  | Wall | Canvas prints, aluminium prints, acrylic prints, photo tiles |
+  | Gifts | Mugs, tote and drawstring bags, pillows |
+  | Clothing | T-shirts, premium T-shirts, hoodies and sweatshirts, with one print on the front |
+
+  `products_list` names them, and `products_show` gives each one's sizes, materials, colours and quantities, and
+  what its file has to be: the page size, bleed, safe area, page count and where the folds fall. Other products and
+  regions appear there as they open.
 
 ## What's in the package
 
@@ -43,7 +57,7 @@ button. It needs tool progress to be on (the default) to receive results.
 | `plugin.json`, `mcp.json` | Portable Agent Plugins v1 manifest. The server is marked `untrusted`, so Hermes asks before every tool that is not read-only. Only tools that send nothing of yours off the machine are marked read-only (`capabilities`, `products_*`, `order_show`, `order_list`, `order_wait`, `order_events`, `ticket_show`, `ticket_list`); `check` (uploads the PDF), `address_validate` and `pickup_points` (send the address) and every tool that changes something ask first. |
 | `server/printsi.mjs` | The MCP server and everything it runs: one readable, unminified JavaScript file, started as `node ${PLUGIN_ROOT}/server/printsi.mjs mcp`. Nothing is downloaded at run time. It is the printsi CLI (also on npm as `printsi`) built into a single file; its only bundled library is zod (see `server/THIRD-PARTY-NOTICES.txt`). |
 | `desktop/plugin.js` | The Desktop pane. Imports only `@hermes/plugin-sdk` and React. |
-| `skills/printsi/` | A short guide for the agent, and two helper scripts for making artwork print-ready. |
+| `skills/printsi/` | A guide for the agent to the file each kind of product needs, and two helper scripts for making artwork print-ready. |
 
 ## Requirements
 

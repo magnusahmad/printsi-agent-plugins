@@ -1,11 +1,14 @@
+import { Buffer } from "node:buffer";
 import { mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
-import { BRAND, type Envelope, type NextAction } from "@internal/core";
+import { AppError, BRAND, type Envelope, type NextAction } from "@internal/core";
+import { isFileId, uploadBytes } from "./check.js";
 import { COMMANDS, type Command, type FlagSpec } from "./commands.js";
-import { run } from "./main.js";
-import { CLI_VERSION } from "./settings.js";
+import { request } from "./http.js";
+import { run, runCommand } from "./main.js";
+import { CLI_VERSION, resolveSettings, type Settings } from "./settings.js";
 
 /**
  * `printsi mcp`: the CLI's commands as Model Context Protocol tools over stdio (spec 01 §7.21), for agent hosts such
@@ -24,7 +27,37 @@ import { CLI_VERSION } from "./settings.js";
  *   envelope). Results carry the envelope as `structuredContent` and a readable summary as text.
  * - Next actions are returned only when a tool can run them, with arguments already in that tool's names.
  * - Credentials live in PRINTSI_CONFIG_DIR (a host should give each profile its own). No update notices.
+ *
+ * The API serves the same tools at POST /mcp (apps/api/src/routes/mcp.ts) by passing a RemoteHost. There the commands
+ * run inside the API, with no disk and no machine of the user's, so three things differ:
+ * - A PDF is an https URL the API downloads (or the id of a file it already holds), never a path.
+ * - The caller's key comes with each request. Nothing is saved, and no guest is made on the caller's behalf: only
+ *   the catalogue tools work without a key.
+ * - Check previews are attached as images straight from the API; nothing is written anywhere.
  */
+
+/** What the hosted endpoint supplies. */
+export interface RemoteHost {
+  /** Reaches the API in-process. */
+  fetch: typeof fetch;
+  /** Fetches a PDF from a URL the caller gave. */
+  download: (url: string) => Promise<Response>;
+  /** Client header on the API calls made for the caller. */
+  client: string;
+  /** Version reported as the server's. */
+  version: string;
+}
+
+export interface McpOptions {
+  sandbox: boolean;
+  vars: Record<string, string | undefined>;
+  remote?: RemoteHost;
+}
+
+/** Tools the hosted endpoint runs without a key: they read the catalogue and nothing else. */
+const PUBLIC_TOOLS = new Set(["capabilities", "products_list", "products_show"]);
+/** Largest PDF the hosted endpoint downloads from a URL; it is held in memory while it is checked and stored. */
+export const MAX_REMOTE_PDF_BYTES = 32 * 1024 * 1024;
 
 /** A next action as a host sees it: `tool` names the MCP tool to call with `args`. */
 type McpNextAction = NextAction & { tool?: string };
@@ -126,10 +159,20 @@ const ENVELOPE_SCHEMA = {
   required: ["ok", "next_actions"],
 };
 
+/** How a PDF argument is described on the hosted endpoint, where there is no path to give. */
+const remotePdf = (description: string) =>
+  `${description.replace(/^Path to the /, "The ").replace(/\.$/, "")}, as an https URL it can be downloaded from (at most ${MAX_REMOTE_PDF_BYTES / 1024 / 1024} MB), or the id (fil_…) of a file sent before.`;
+
+/** Arguments of a tool that name a PDF. */
+const pdfArgs = (command: Command) => [
+  ...command.positionals.filter((p) => p.name === "pdf").map((p) => p.name),
+  ...toolFlags(command).flatMap(([name, f]) => (f.valueName === "pdf" ? [mcpName(name)] : [])),
+];
+
 /** The MCP tool listing: one input property per positional and flag, all described from the CLI's own help. */
-export function listTools() {
+export function listTools(remote = false) {
   return toolDefs().map((t) => {
-    const properties: Record<string, unknown> = {};
+    const properties: Record<string, { description?: string } & Record<string, unknown>> = {};
     const required: string[] = [];
     for (const p of t.command.positionals) {
       properties[p.name] = { type: "string", description: p.description };
@@ -138,6 +181,12 @@ export function listTools() {
     for (const [name, f] of toolFlags(t.command)) {
       properties[mcpName(name)] = propertyFor(name, f);
       if (f.required) required.push(mcpName(name));
+    }
+    if (remote) {
+      for (const name of pdfArgs(t.command)) {
+        const property = properties[name];
+        if (property) property.description = remotePdf(property.description ?? "PDF.");
+      }
     }
     if (t.name === "order_wait") {
       properties.timeout = { type: "number", description: `Seconds to wait, at most ${MAX_WAIT_S} (default 25).` };
@@ -157,27 +206,39 @@ export function listTools() {
   });
 }
 
-/** Turns tool arguments into CLI arguments for the same command. */
-export function toArgv(tool: ToolDef, args: Record<string, unknown>, sandbox: boolean): string[] {
-  const argv = [...tool.command.path];
+/** Turns tool arguments into the same command's flags and positionals, with the values the CLI's parser would give. */
+export function toInput(tool: ToolDef, args: Record<string, unknown>, sandbox: boolean) {
+  const flags: Record<string, string | boolean | string[]> = {};
   for (const [name, f] of toolFlags(tool.command)) {
     const v = args[mcpName(name)] ?? args[name];
     if (v === undefined || v === null || v === false) continue;
-    if (f.type === "boolean") argv.push(`--${name}`);
-    else if (Array.isArray(v)) for (const item of v) argv.push(`--${name}`, String(item));
-    else argv.push(`--${name}`, typeof v === "object" ? JSON.stringify(v) : String(v));
+    if (f.type === "boolean") flags[name] = true;
+    else if (Array.isArray(v)) flags[name] = v.map(String);
+    else flags[name] = typeof v === "object" ? JSON.stringify(v) : String(v);
   }
   if (tool.name === "order_wait") {
     const want = Number(args.timeout ?? 25);
-    argv.push("--timeout", String(Math.min(Math.max(Number.isFinite(want) ? want : 25, 1), MAX_WAIT_S)));
+    flags.timeout = String(Math.min(Math.max(Number.isFinite(want) ? want : 25, 1), MAX_WAIT_S));
   }
-  if (sandbox) argv.push("--sandbox");
-  argv.push("--format", "json");
-  // Positionals last, after "--": a value that starts with "-" can never be read as a flag.
+  if (sandbox) flags.sandbox = true;
+  flags.format = "json";
   const positionals = tool.command.positionals.flatMap((p) => {
     const v = args[p.name];
     return v !== undefined && v !== null ? [String(v)] : [];
   });
+  return { flags, positionals };
+}
+
+/** Turns tool arguments into CLI arguments for the same command. */
+export function toArgv(tool: ToolDef, args: Record<string, unknown>, sandbox: boolean): string[] {
+  const { flags, positionals } = toInput(tool, args, sandbox);
+  const argv = [...tool.command.path];
+  for (const [name, v] of Object.entries(flags)) {
+    if (v === true) argv.push(`--${name}`);
+    else if (Array.isArray(v)) for (const item of v) argv.push(`--${name}`, item);
+    else argv.push(`--${name}`, String(v));
+  }
+  // Positionals last, after "--": a value that starts with "-" can never be read as a flag.
   if (positionals.length > 0) argv.push("--", ...positionals);
   return argv;
 }
@@ -227,14 +288,24 @@ function callableAction(action: NextAction): McpNextAction | null {
   return { ...action, tool: tool.name, args, command: undefined };
 }
 
-export async function callTool(
-  name: string,
-  args: Record<string, unknown>,
-  opts: { sandbox: boolean; vars: Record<string, string | undefined> },
-) {
+export async function callTool(name: string, input: Record<string, unknown>, opts: McpOptions) {
+  let args = input;
   const tool = toolDefs().find((t) => t.name === name);
   // An unknown tool is a protocol error (the host's request is wrong), not a tool execution error.
   if (!tool) throw new UnknownToolError(name);
+  const vars = { ...opts.vars, [`${BRAND.envPrefix}NO_UPDATE_NOTICE`]: "1" };
+  const remote = opts.remote;
+  const host = remote && { fetch: remote.fetch, client: remote.client };
+  if (remote && !PUBLIC_TOOLS.has(name) && !vars[`${BRAND.envPrefix}TOKEN`]) {
+    const base = resolveSettings({ sandbox: opts.sandbox }, vars, 30).apiBase;
+    return failed(
+      new AppError(
+        "authentication",
+        "MISSING_CREDENTIALS",
+        `${name} needs a ${BRAND.name} key. Create a guest key once (POST ${base}/v1/guests returns it, free and without signing up), then send it with every request as the header "Authorization: Bearer <key>". Orders and files belong to that key.`,
+      ),
+    );
+  }
   const known = new Set([
     ...tool.command.positionals.map((p) => p.name),
     ...toolFlags(tool.command).flatMap(([f]) => [f, mcpName(f)]),
@@ -271,9 +342,22 @@ export async function callTool(
       };
     }
   }
+  // On the hosted endpoint a PDF is a URL: fetch it and store it, and hand the command the stored file's id.
+  const settings: Settings = { ...resolveSettings({ sandbox: opts.sandbox }, vars, tool.command.timeoutS), ...host };
+  if (remote) {
+    try {
+      args = { ...args };
+      for (const key of pdfArgs(tool.command)) {
+        if (typeof args[key] === "string") args[key] = await remoteFile(args[key] as string, key, settings, remote);
+      }
+    } catch (err) {
+      if (err instanceof AppError) return failed(err);
+      throw err;
+    }
+  }
   const argv = toArgv(tool, args, opts.sandbox);
   // A check always saves its page previews, to a temp folder of its own, so the result can carry them as images.
-  if (tool.name === "check") {
+  if (tool.name === "check" && !remote) {
     const at = argv.indexOf("--");
     argv.splice(
       at < 0 ? argv.length : at,
@@ -282,12 +366,13 @@ export async function callTool(
       await mkdtemp(join(tmpdir(), `${BRAND.name}-previews-`)),
     );
   }
-  const result = await run(argv, {
-    ...opts.vars,
-    [`${BRAND.envPrefix}NO_UPDATE_NOTICE`]: "1",
-  });
+  // The Workers runtime has no argument parser, and needs none: the arguments are already apart.
+  const result = remote
+    ? await runCommand(tool.command, toInput(tool, args, opts.sandbox), vars, host)
+    : await run(argv, vars, host);
   const envelope = localPreviews(withTools(result.envelope));
-  const images = tool.name === "check" ? await previewImages(envelope) : [];
+  const images =
+    tool.name !== "check" ? [] : remote ? await fetchedPreviews(envelope, settings) : await previewImages(envelope);
   const note =
     images.length > 0
       ? "\nThe page preview is attached as an image (trim, safe area and each issue are marked on it). Look at the attached image; there is no URL to open."
@@ -298,6 +383,101 @@ export async function callTool(
     isError: !envelope.ok,
     resultType: "complete",
   };
+}
+
+/** A tool result for a failure found before the command ran, in the same shape as the command's own errors. */
+function failed(err: AppError) {
+  const envelope: Envelope = { ok: false, error: err.toBody(), next_actions: [] };
+  return {
+    content: [{ type: "text", text: modelText(envelope) }],
+    structuredContent: envelope,
+    isError: true,
+    resultType: "complete",
+  };
+}
+
+/**
+ * A PDF argument on the hosted endpoint: a file id is kept; an https URL is downloaded and stored as the caller's
+ * file. Only https, and never more than MAX_REMOTE_PDF_BYTES, whatever the far end says its length is.
+ */
+async function remoteFile(value: string, param: string, settings: Settings, remote: RemoteHost): Promise<string> {
+  if (isFileId(value)) return value;
+  const url = URL.canParse(value) ? new URL(value) : null;
+  if (url?.protocol !== "https:" || url.username || url.password) {
+    throw new AppError(
+      "invalid_request",
+      "FILE_URL_REQUIRED",
+      `${param} must be an https URL the PDF can be downloaded from, or a file id (fil_…). This server runs remotely and can't read a path on your machine: put the PDF somewhere it can be fetched, or use the ${BRAND.name} CLI (npx -y ${BRAND.name}), which reads local files.`,
+      { param },
+    );
+  }
+  const unreachable = (why: string) =>
+    new AppError("invalid_request", "FILE_DOWNLOAD_FAILED", `Couldn't download the PDF from ${url.host}: ${why}.`, {
+      param,
+    });
+  const limitMb = MAX_REMOTE_PDF_BYTES / 1024 / 1024;
+  const tooLarge = () =>
+    new AppError("invalid_request", "FILE_TOO_LARGE", `The PDF at ${url.host} is over ${limitMb} MB.`, {
+      param,
+      details: { max_bytes: MAX_REMOTE_PDF_BYTES },
+    });
+  let res: Response;
+  try {
+    res = await remote.download(url.href);
+  } catch (err) {
+    throw unreachable(err instanceof Error ? err.message : String(err));
+  }
+  if (!res.ok || !res.body) {
+    await res.body?.cancel();
+    throw unreachable(`it answered ${res.status}`);
+  }
+  if (Number(res.headers.get("Content-Length")) > MAX_REMOTE_PDF_BYTES) {
+    await res.body.cancel();
+    throw tooLarge();
+  }
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  const reader = res.body.getReader();
+  for (;;) {
+    const { done, value: chunk } = await reader.read();
+    if (done) break;
+    size += chunk.length;
+    if (size > MAX_REMOTE_PDF_BYTES) {
+      await reader.cancel();
+      throw tooLarge();
+    }
+    chunks.push(chunk);
+  }
+  const pdf = new Uint8Array(size);
+  let at = 0;
+  for (const chunk of chunks) {
+    pdf.set(chunk, at);
+    at += chunk.length;
+  }
+  const name = decodeURIComponent(url.pathname.split("/").pop() ?? "") || "file.pdf";
+  return uploadBytes(settings, name, pdf, Date.now() + settings.timeoutMs);
+}
+
+/** The first page previews of a finished check, fetched from the API with the caller's key. Best effort. */
+async function fetchedPreviews(
+  envelope: Envelope,
+  settings: Settings,
+): Promise<{ type: "image"; data: string; mimeType: string }[]> {
+  const check = (envelope.ok ? (envelope.data as { check?: { previews?: { url?: string }[] } }) : null)?.check;
+  const images: { type: "image"; data: string; mimeType: string }[] = [];
+  for (const preview of (check?.previews ?? []).slice(0, MAX_PREVIEW_PAGES)) {
+    if (!preview.url) continue;
+    try {
+      const res = await request(settings, { path: preview.url, headers: { Accept: "image/png" } });
+      if (!res.ok) continue;
+      const bytes = Buffer.from(await res.arrayBuffer());
+      if (bytes.length <= MAX_PREVIEW_BYTES)
+        images.push({ type: "image", data: bytes.toString("base64"), mimeType: "image/png" });
+    } catch {
+      // The preview is a convenience; the check result stands without it.
+    }
+  }
+  return images;
 }
 
 /**
@@ -378,10 +558,7 @@ class UnknownToolError extends Error {
 type JsonRpc = { jsonrpc: "2.0"; id?: string | number | null; method?: string; params?: Record<string, unknown> };
 
 /** Handles one JSON-RPC message; returns the response, or null for notifications. */
-export async function handleMessage(
-  msg: JsonRpc,
-  opts: { sandbox: boolean; vars: Record<string, string | undefined> },
-): Promise<Record<string, unknown> | null> {
+export async function handleMessage(msg: JsonRpc, opts: McpOptions): Promise<Record<string, unknown> | null> {
   const reply = (result: unknown) => ({ jsonrpc: "2.0", id: msg.id ?? null, result });
   const error = (code: number, message: string) => ({ jsonrpc: "2.0", id: msg.id ?? null, error: { code, message } });
   if (msg.id === undefined) return null; // notifications (initialized, cancelled) need no answer
@@ -400,8 +577,11 @@ export async function handleMessage(
       },
     };
   }
-  const serverInfo = { name: BRAND.name, version: CLI_VERSION };
-  const instructions = `${BRAND.name} checks print-ready PDFs for free and orders professional printing from them. Check the file, get a quote, and buy only with the user's go-ahead: buying returns a link they pay on.${opts.sandbox ? " (sandbox: nothing is printed or charged)" : ""}`;
+  const serverInfo = { name: BRAND.name, version: opts.remote?.version ?? CLI_VERSION };
+  const hosted = opts.remote
+    ? ` Give a PDF as an https URL. Everything except the catalogue tools needs a guest key, sent as "Authorization: Bearer <key>": POST ${resolveSettings({ sandbox: opts.sandbox }, opts.vars, 30).apiBase}/v1/guests returns one, free and without signing up.`
+    : "";
+  const instructions = `${BRAND.name} checks print-ready PDFs for free and orders professional printing from them. Check the file, get a quote, and buy only with the user's go-ahead: buying returns a link they pay on.${hosted}${opts.sandbox ? " (sandbox: nothing is printed or charged)" : ""}`;
   switch (msg.method) {
     case "server/discover":
       return reply({
@@ -426,7 +606,12 @@ export async function handleMessage(
       return reply({});
     case "tools/list":
       // The listing is the same for every caller, so it is cacheable publicly; ttlMs is a freshness hint.
-      return reply({ tools: listTools(), ttlMs: TOOLS_TTL_MS, cacheScope: "public", resultType: "complete" });
+      return reply({
+        tools: listTools(Boolean(opts.remote)),
+        ttlMs: TOOLS_TTL_MS,
+        cacheScope: "public",
+        resultType: "complete",
+      });
     case "tools/call": {
       const name = String(msg.params?.name ?? "");
       const args = (msg.params?.arguments ?? {}) as Record<string, unknown>;

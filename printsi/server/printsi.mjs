@@ -19874,6 +19874,7 @@ function shellQuote(s) {
 }
 
 // src/check.ts
+import { Buffer as Buffer2 } from "buffer";
 import { createHash } from "crypto";
 import { createReadStream } from "fs";
 import { mkdir as mkdir2, open as open2, stat, writeFile as writeFile2 } from "fs/promises";
@@ -19934,7 +19935,7 @@ var RETRY_STATUSES = /* @__PURE__ */ new Set([429, 503]);
 var MAX_ATTEMPTS = 3;
 async function request(settings, opts) {
   const method = opts.method ?? "GET";
-  const doFetch = opts.deps?.fetch ?? fetch;
+  const doFetch = opts.deps?.fetch ?? settings.fetch ?? fetch;
   const sleep = opts.deps?.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
   const url2 = new URL(/^https?:\/\//.test(opts.path) ? opts.path : `${settings.apiBase}${opts.path}`);
   for (const [k, v] of Object.entries(opts.query ?? {})) url2.searchParams.set(k, v);
@@ -19994,6 +19995,7 @@ function apiGet(settings, path, query = {}) {
   return apiRequest(settings, { path, query });
 }
 function clientHeader(settings) {
+  if (settings.client) return settings.client;
   const base = `${BRAND.name}-cli/${CLI_VERSION} node/${process.versions.node}`;
   return settings.telemetry ? `${base} harness=${settings.harness}` : base;
 }
@@ -20198,13 +20200,22 @@ var MAX_BYTES = 100 * 1024 * 1024;
 var LONG_POLL_S = 25;
 async function runCheck(settings, vars, input2) {
   const deadline = Date.now() + settings.timeoutMs;
-  const path = resolve(input2.file);
-  const local = await inspectLocalFile(path);
-  return withCredential(settings, vars, (warnings) => checkUploaded(settings, input2, path, local, deadline, warnings));
+  const upload2 = await prepareFile(settings, input2.file, deadline);
+  return withCredential(
+    settings,
+    vars,
+    async (warnings) => checkUploaded(settings, input2, await upload2(), deadline, warnings)
+  );
 }
-async function checkUploaded(settings, input2, path, { bytes, sha256 }, deadline, initialWarnings) {
+var isFileId = (value) => /^fil_[0-9A-HJKMNP-TV-Z]{26}$/.test(value);
+async function prepareFile(settings, value, deadline) {
+  if (isFileId(value)) return async () => value;
+  const path = resolve(value);
+  const local = await inspectLocalFile(path);
+  return () => uploadFile(settings, path, local, deadline);
+}
+async function checkUploaded(settings, input2, fileId, deadline, initialWarnings) {
   const warnings = [...initialWarnings];
-  const fileId = await uploadFile(settings, path, { bytes, sha256 }, deadline);
   let envelope = await expectOk(
     await apiRequest(settings, {
       method: "POST",
@@ -20271,25 +20282,33 @@ async function checkUploaded(settings, input2, path, { bytes, sha256 }, deadline
   }
   return { ...envelope, next_actions: nextActions, warnings: [...envelope.warnings ?? [], ...warnings] };
 }
-async function uploadFile(settings, path, { bytes, sha256 }, deadline) {
+function uploadFile(settings, path, { bytes, sha256 }, deadline) {
+  return upload(
+    settings,
+    { name: basename(path), bytes, sha256 },
+    () => Readable.toWeb(createReadStream(path)),
+    deadline
+  );
+}
+async function uploadBytes(settings, name, pdf, deadline) {
+  if (pdf.length > MAX_BYTES) throw tooLarge(name, pdf.length);
+  if (!Buffer2.from(pdf.buffer, pdf.byteOffset, Math.min(pdf.length, 1024)).includes("%PDF-")) throw notPdf(name);
+  const sha256 = createHash("sha256").update(pdf).digest("hex");
+  return upload(settings, { name, bytes: pdf.length, sha256 }, () => pdf, deadline);
+}
+async function upload(settings, { name, bytes, sha256 }, body, deadline) {
   const created = await expectOk(
     await apiRequest(settings, {
       method: "POST",
       path: "/v1/files",
-      json: { name: basename(path), bytes, sha256, content_type: "application/pdf", purpose: "artwork" },
+      json: { name, bytes, sha256, content_type: "application/pdf", purpose: "artwork" },
       deadline
     })
   );
-  const { file: file3, upload } = created.data;
-  if (upload) {
+  const { file: file3, upload: target } = created.data;
+  if (target) {
     await expectOk(
-      await apiRequest(settings, {
-        method: upload.method,
-        path: upload.url,
-        headers: upload.headers,
-        body: () => Readable.toWeb(createReadStream(path)),
-        deadline
-      })
+      await apiRequest(settings, { method: target.method, path: target.url, headers: target.headers, body, deadline })
     );
   }
   return file3.id;
@@ -20303,35 +20322,34 @@ async function inspectLocalFile(path) {
   } catch {
     throw new AppError("invalid_request", "FILE_NOT_FOUND", `No file at ${path}.`, { param: "pdf" });
   }
-  if (size > MAX_BYTES) {
-    throw new AppError(
-      "invalid_request",
-      "FILE_TOO_LARGE",
-      `${basename(path)} is ${(size / 1024 / 1024).toFixed(1)} MB; the limit is ${MAX_BYTES / 1024 / 1024} MB.`,
-      {
-        param: "pdf",
-        details: { bytes: size, max_bytes: MAX_BYTES }
-      }
-    );
-  }
+  if (size > MAX_BYTES) throw tooLarge(basename(path), size);
   const handle = await open2(path, "r");
-  const head = Buffer.alloc(1024);
+  const head = Buffer2.alloc(1024);
   try {
     await handle.read(head, 0, 1024, 0);
   } finally {
     await handle.close();
   }
-  if (!head.includes("%PDF-")) {
-    throw new AppError(
-      "invalid_request",
-      "NOT_PDF",
-      `${basename(path)} isn't a PDF. Only print-ready PDFs are accepted: export or convert the design to PDF first, with 0.125 in bleed (see \`${BRAND.name} products show <product>\` for exact sizes).`,
-      { param: "pdf" }
-    );
-  }
+  if (!head.includes("%PDF-")) throw notPdf(basename(path));
   const hash2 = createHash("sha256");
   for await (const chunk of createReadStream(path)) hash2.update(chunk);
   return { bytes: size, sha256: hash2.digest("hex") };
+}
+function tooLarge(name, size) {
+  return new AppError(
+    "invalid_request",
+    "FILE_TOO_LARGE",
+    `${name} is ${(size / 1024 / 1024).toFixed(1)} MB; the limit is ${MAX_BYTES / 1024 / 1024} MB.`,
+    { param: "pdf", details: { bytes: size, max_bytes: MAX_BYTES } }
+  );
+}
+function notPdf(name) {
+  return new AppError(
+    "invalid_request",
+    "NOT_PDF",
+    `${name} isn't a PDF. Only print-ready PDFs are accepted: export or convert the design to PDF first, with 0.125 in bleed (see \`${BRAND.name} products show <product>\` for exact sizes).`,
+    { param: "pdf" }
+  );
 }
 async function expectOk(envelope) {
   if (!envelope.ok) {
@@ -20404,10 +20422,9 @@ async function orderCreate(settings, vars, flags, options) {
   const shipTo = await parseShipTo(
     requireString(flags, "ship-to", "--ship-to is required: a JSON file, inline JSON, or - for stdin.")
   );
-  const path = resolve2(file3);
-  const local = await inspectLocalFile(path);
+  const upload2 = await prepareFile(settings, file3, deadline);
   return withCredential(settings, vars, async (warnings) => {
-    const fileId = await uploadFile(settings, path, local, deadline);
+    const fileId = await upload2();
     const created = await expectOk(
       await apiRequest(settings, {
         method: "POST",
@@ -20452,9 +20469,8 @@ async function orderUpdate(settings, vars, id, flags, options) {
   if (typeof flags.product === "string" || Object.keys(options).length > 0) {
     body.spec = { ...typeof flags.product === "string" && { product: flags.product }, options };
   }
-  const filePath = typeof flags.file === "string" ? resolve2(flags.file) : null;
-  const local = filePath ? await inspectLocalFile(filePath) : null;
-  if (Object.keys(body).length === 0 && !filePath) {
+  const upload2 = typeof flags.file === "string" ? await prepareFile(settings, flags.file, deadline) : null;
+  if (Object.keys(body).length === 0 && !upload2) {
     throw new AppError(
       "usage",
       "NOTHING_TO_UPDATE",
@@ -20462,7 +20478,7 @@ async function orderUpdate(settings, vars, id, flags, options) {
     );
   }
   return withOrderCredential(settings, vars, id, async () => {
-    if (filePath && local) body.file_id = await uploadFile(settings, filePath, local, deadline);
+    if (upload2) body.file_id = await upload2();
     const updated = await expectOk(
       await apiRequest(settings, { method: "PATCH", path: `/v1/orders/${id}`, json: body, deadline })
     );
@@ -20963,7 +20979,7 @@ var COMMANDS = [
     },
     examples: [
       `${BRAND.name} check flyer.pdf --product flyer --size 8.5x11`,
-      `${BRAND.name} check brochure.pdf --product brochure --size 8.5x11 --fold trifold --preview-dir ./preview`
+      `${BRAND.name} check brochure.pdf --product brochure --size 16.5x8.5 --fold trifold --preview-dir ./preview`
     ],
     timeoutS: 120,
     needsNetwork: true,
@@ -21390,32 +21406,50 @@ function renderText(envelope) {
 }
 
 // src/main.ts
-async function run(argv2, vars = process.env) {
-  let settings = resolveSettings({}, vars, 30);
+async function run(argv2, vars = process.env, host = {}) {
+  const settingsFor = settingsWith(vars, host);
+  let settings = settingsFor({}, 30);
   let envelope;
   try {
     const words = commandWords(argv2);
     const wantsHelp = argv2.includes("--help") || argv2.includes("-h");
     const match = findCommand(words);
     if (words.length === 0 || wantsHelp && !match) {
-      settings = resolveSettings(globalFlags(argv2), vars, 5);
+      settings = settingsFor(globalFlags(argv2), 5);
       envelope = await helpFor([], settings);
     } else if (!match) {
       throw unknownCommand(words);
     } else if (wantsHelp) {
-      settings = resolveSettings(globalFlags(argv2), vars, 5);
+      settings = settingsFor(globalFlags(argv2), 5);
       envelope = await helpFor(match.command.path, settings);
     } else {
       const { command, consumed } = match;
       const parsed = parseCommandArgs(command, removeWords(argv2, words.slice(0, consumed)));
-      settings = resolveSettings(parsed.values, vars, command.timeoutS);
+      settings = settingsFor(parsed.values, command.timeoutS);
       checkPositionals(command, parsed.positionals);
       envelope = await command.run({ settings, vars, positionals: parsed.positionals, flags: parsed.values });
     }
   } catch (err) {
     envelope = toErrorEnvelope(err);
   }
-  envelope = finalize2(envelope, settings);
+  return finish(envelope, settings);
+}
+async function runCommand(command, input2, vars, host = {}) {
+  const settingsFor = settingsWith(vars, host);
+  let settings = settingsFor({}, 30);
+  let envelope;
+  try {
+    settings = settingsFor(input2.flags, command.timeoutS);
+    checkPositionals(command, input2.positionals);
+    envelope = await command.run({ settings, vars, positionals: input2.positionals, flags: input2.flags });
+  } catch (err) {
+    envelope = toErrorEnvelope(err);
+  }
+  return finish(envelope, settings);
+}
+var settingsWith = (vars, host) => (flags, timeoutS) => ({ ...resolveSettings(flags, vars, timeoutS), ...host });
+function finish(result, settings) {
+  const envelope = finalize2(result, settings);
   const stdout = settings.format === "text" ? renderText(envelope) : `${JSON.stringify(envelope, null, 2)}
 `;
   return { stdout, exitCode: exitCodeFor(envelope), envelope };
@@ -21531,10 +21565,13 @@ function finalize2(envelope, settings) {
 }
 
 // src/mcp.ts
+import { Buffer as Buffer3 } from "buffer";
 import { mkdtemp, readFile as readFile3 } from "fs/promises";
 import { tmpdir } from "os";
 import { join as join4 } from "path";
 import { createInterface } from "readline";
+var PUBLIC_TOOLS = /* @__PURE__ */ new Set(["capabilities", "products_list", "products_show"]);
+var MAX_REMOTE_PDF_BYTES = 32 * 1024 * 1024;
 var PROTOCOLS = ["2026-07-28", "2025-11-25", "2025-06-18"];
 var MAX_WAIT_S = 120;
 var TOOLS_TTL_MS = 36e5;
@@ -21610,7 +21647,12 @@ var ENVELOPE_SCHEMA = {
   },
   required: ["ok", "next_actions"]
 };
-function listTools() {
+var remotePdf = (description) => `${description.replace(/^Path to the /, "The ").replace(/\.$/, "")}, as an https URL it can be downloaded from (at most ${MAX_REMOTE_PDF_BYTES / 1024 / 1024} MB), or the id (fil_\u2026) of a file sent before.`;
+var pdfArgs = (command) => [
+  ...command.positionals.filter((p) => p.name === "pdf").map((p) => p.name),
+  ...toolFlags(command).flatMap(([name, f]) => f.valueName === "pdf" ? [mcpName(name)] : [])
+];
+function listTools(remote = false) {
   return toolDefs().map((t) => {
     const properties = {};
     const required2 = [];
@@ -21621,6 +21663,12 @@ function listTools() {
     for (const [name, f] of toolFlags(t.command)) {
       properties[mcpName(name)] = propertyFor(name, f);
       if (f.required) required2.push(mcpName(name));
+    }
+    if (remote) {
+      for (const name of pdfArgs(t.command)) {
+        const property = properties[name];
+        if (property) property.description = remotePdf(property.description ?? "PDF.");
+      }
     }
     if (t.name === "order_wait") {
       properties.timeout = { type: "number", description: `Seconds to wait, at most ${MAX_WAIT_S} (default 25).` };
@@ -21639,25 +21687,35 @@ function listTools() {
     };
   });
 }
-function toArgv(tool, args, sandbox) {
-  const argv2 = [...tool.command.path];
+function toInput(tool, args, sandbox) {
+  const flags = {};
   for (const [name, f] of toolFlags(tool.command)) {
     const v = args[mcpName(name)] ?? args[name];
     if (v === void 0 || v === null || v === false) continue;
-    if (f.type === "boolean") argv2.push(`--${name}`);
-    else if (Array.isArray(v)) for (const item of v) argv2.push(`--${name}`, String(item));
-    else argv2.push(`--${name}`, typeof v === "object" ? JSON.stringify(v) : String(v));
+    if (f.type === "boolean") flags[name] = true;
+    else if (Array.isArray(v)) flags[name] = v.map(String);
+    else flags[name] = typeof v === "object" ? JSON.stringify(v) : String(v);
   }
   if (tool.name === "order_wait") {
     const want = Number(args.timeout ?? 25);
-    argv2.push("--timeout", String(Math.min(Math.max(Number.isFinite(want) ? want : 25, 1), MAX_WAIT_S)));
+    flags.timeout = String(Math.min(Math.max(Number.isFinite(want) ? want : 25, 1), MAX_WAIT_S));
   }
-  if (sandbox) argv2.push("--sandbox");
-  argv2.push("--format", "json");
+  if (sandbox) flags.sandbox = true;
+  flags.format = "json";
   const positionals = tool.command.positionals.flatMap((p) => {
     const v = args[p.name];
     return v !== void 0 && v !== null ? [String(v)] : [];
   });
+  return { flags, positionals };
+}
+function toArgv(tool, args, sandbox) {
+  const { flags, positionals } = toInput(tool, args, sandbox);
+  const argv2 = [...tool.command.path];
+  for (const [name, v] of Object.entries(flags)) {
+    if (v === true) argv2.push(`--${name}`);
+    else if (Array.isArray(v)) for (const item of v) argv2.push(`--${name}`, item);
+    else argv2.push(`--${name}`, String(v));
+  }
   if (positionals.length > 0) argv2.push("--", ...positionals);
   return argv2;
 }
@@ -21688,9 +21746,23 @@ function callableAction(action) {
   }
   return { ...action, tool: tool.name, args, command: void 0 };
 }
-async function callTool(name, args, opts) {
+async function callTool(name, input2, opts) {
+  let args = input2;
   const tool = toolDefs().find((t) => t.name === name);
   if (!tool) throw new UnknownToolError(name);
+  const vars = { ...opts.vars, [`${BRAND.envPrefix}NO_UPDATE_NOTICE`]: "1" };
+  const remote = opts.remote;
+  const host = remote && { fetch: remote.fetch, client: remote.client };
+  if (remote && !PUBLIC_TOOLS.has(name) && !vars[`${BRAND.envPrefix}TOKEN`]) {
+    const base = resolveSettings({ sandbox: opts.sandbox }, vars, 30).apiBase;
+    return failed(
+      new AppError(
+        "authentication",
+        "MISSING_CREDENTIALS",
+        `${name} needs a ${BRAND.name} key. Create a guest key once (POST ${base}/v1/guests returns it, free and without signing up), then send it with every request as the header "Authorization: Bearer <key>". Orders and files belong to that key.`
+      )
+    );
+  }
   const known = /* @__PURE__ */ new Set([
     ...tool.command.positionals.map((p) => p.name),
     ...toolFlags(tool.command).flatMap(([f]) => [f, mcpName(f)]),
@@ -21723,8 +21795,20 @@ async function callTool(name, args, opts) {
       };
     }
   }
+  const settings = { ...resolveSettings({ sandbox: opts.sandbox }, vars, tool.command.timeoutS), ...host };
+  if (remote) {
+    try {
+      args = { ...args };
+      for (const key of pdfArgs(tool.command)) {
+        if (typeof args[key] === "string") args[key] = await remoteFile(args[key], key, settings, remote);
+      }
+    } catch (err) {
+      if (err instanceof AppError) return failed(err);
+      throw err;
+    }
+  }
   const argv2 = toArgv(tool, args, opts.sandbox);
-  if (tool.name === "check") {
+  if (tool.name === "check" && !remote) {
     const at = argv2.indexOf("--");
     argv2.splice(
       at < 0 ? argv2.length : at,
@@ -21733,12 +21817,9 @@ async function callTool(name, args, opts) {
       await mkdtemp(join4(tmpdir(), `${BRAND.name}-previews-`))
     );
   }
-  const result = await run(argv2, {
-    ...opts.vars,
-    [`${BRAND.envPrefix}NO_UPDATE_NOTICE`]: "1"
-  });
+  const result = remote ? await runCommand(tool.command, toInput(tool, args, opts.sandbox), vars, host) : await run(argv2, vars, host);
   const envelope = localPreviews(withTools(result.envelope));
-  const images = tool.name === "check" ? await previewImages(envelope) : [];
+  const images = tool.name !== "check" ? [] : remote ? await fetchedPreviews(envelope, settings) : await previewImages(envelope);
   const note = images.length > 0 ? "\nThe page preview is attached as an image (trim, safe area and each issue are marked on it). Look at the attached image; there is no URL to open." : "";
   return {
     content: [{ type: "text", text: modelText(envelope) + note }, ...images],
@@ -21746,6 +21827,86 @@ async function callTool(name, args, opts) {
     isError: !envelope.ok,
     resultType: "complete"
   };
+}
+function failed(err) {
+  const envelope = { ok: false, error: err.toBody(), next_actions: [] };
+  return {
+    content: [{ type: "text", text: modelText(envelope) }],
+    structuredContent: envelope,
+    isError: true,
+    resultType: "complete"
+  };
+}
+async function remoteFile(value, param, settings, remote) {
+  if (isFileId(value)) return value;
+  const url2 = URL.canParse(value) ? new URL(value) : null;
+  if (url2?.protocol !== "https:" || url2.username || url2.password) {
+    throw new AppError(
+      "invalid_request",
+      "FILE_URL_REQUIRED",
+      `${param} must be an https URL the PDF can be downloaded from, or a file id (fil_\u2026). This server runs remotely and can't read a path on your machine: put the PDF somewhere it can be fetched, or use the ${BRAND.name} CLI (npx -y ${BRAND.name}), which reads local files.`,
+      { param }
+    );
+  }
+  const unreachable = (why) => new AppError("invalid_request", "FILE_DOWNLOAD_FAILED", `Couldn't download the PDF from ${url2.host}: ${why}.`, {
+    param
+  });
+  const limitMb = MAX_REMOTE_PDF_BYTES / 1024 / 1024;
+  const tooLarge2 = () => new AppError("invalid_request", "FILE_TOO_LARGE", `The PDF at ${url2.host} is over ${limitMb} MB.`, {
+    param,
+    details: { max_bytes: MAX_REMOTE_PDF_BYTES }
+  });
+  let res;
+  try {
+    res = await remote.download(url2.href);
+  } catch (err) {
+    throw unreachable(err instanceof Error ? err.message : String(err));
+  }
+  if (!res.ok || !res.body) {
+    await res.body?.cancel();
+    throw unreachable(`it answered ${res.status}`);
+  }
+  if (Number(res.headers.get("Content-Length")) > MAX_REMOTE_PDF_BYTES) {
+    await res.body.cancel();
+    throw tooLarge2();
+  }
+  const chunks = [];
+  let size = 0;
+  const reader = res.body.getReader();
+  for (; ; ) {
+    const { done, value: chunk } = await reader.read();
+    if (done) break;
+    size += chunk.length;
+    if (size > MAX_REMOTE_PDF_BYTES) {
+      await reader.cancel();
+      throw tooLarge2();
+    }
+    chunks.push(chunk);
+  }
+  const pdf = new Uint8Array(size);
+  let at = 0;
+  for (const chunk of chunks) {
+    pdf.set(chunk, at);
+    at += chunk.length;
+  }
+  const name = decodeURIComponent(url2.pathname.split("/").pop() ?? "") || "file.pdf";
+  return uploadBytes(settings, name, pdf, Date.now() + settings.timeoutMs);
+}
+async function fetchedPreviews(envelope, settings) {
+  const check2 = (envelope.ok ? envelope.data : null)?.check;
+  const images = [];
+  for (const preview of (check2?.previews ?? []).slice(0, MAX_PREVIEW_PAGES)) {
+    if (!preview.url) continue;
+    try {
+      const res = await request(settings, { path: preview.url, headers: { Accept: "image/png" } });
+      if (!res.ok) continue;
+      const bytes = Buffer3.from(await res.arrayBuffer());
+      if (bytes.length <= MAX_PREVIEW_BYTES)
+        images.push({ type: "image", data: bytes.toString("base64"), mimeType: "image/png" });
+    } catch {
+    }
+  }
+  return images;
 }
 function localPreviews(envelope) {
   const data = envelope.ok ? envelope.data : void 0;
@@ -21816,8 +21977,9 @@ async function handleMessage(msg, opts) {
       }
     };
   }
-  const serverInfo = { name: BRAND.name, version: CLI_VERSION };
-  const instructions = `${BRAND.name} checks print-ready PDFs for free and orders professional printing from them. Check the file, get a quote, and buy only with the user's go-ahead: buying returns a link they pay on.${opts.sandbox ? " (sandbox: nothing is printed or charged)" : ""}`;
+  const serverInfo = { name: BRAND.name, version: opts.remote?.version ?? CLI_VERSION };
+  const hosted = opts.remote ? ` Give a PDF as an https URL. Everything except the catalogue tools needs a guest key, sent as "Authorization: Bearer <key>": POST ${resolveSettings({ sandbox: opts.sandbox }, opts.vars, 30).apiBase}/v1/guests returns one, free and without signing up.` : "";
+  const instructions = `${BRAND.name} checks print-ready PDFs for free and orders professional printing from them. Check the file, get a quote, and buy only with the user's go-ahead: buying returns a link they pay on.${hosted}${opts.sandbox ? " (sandbox: nothing is printed or charged)" : ""}`;
   switch (msg.method) {
     case "server/discover":
       return reply({
@@ -21841,7 +22003,12 @@ async function handleMessage(msg, opts) {
     case "ping":
       return reply({});
     case "tools/list":
-      return reply({ tools: listTools(), ttlMs: TOOLS_TTL_MS, cacheScope: "public", resultType: "complete" });
+      return reply({
+        tools: listTools(Boolean(opts.remote)),
+        ttlMs: TOOLS_TTL_MS,
+        cacheScope: "public",
+        resultType: "complete"
+      });
     case "tools/call": {
       const name = String(msg.params?.name ?? "");
       const args = msg.params?.arguments ?? {};

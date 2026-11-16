@@ -1,7 +1,7 @@
 import { parseArgs } from "node:util";
 import { AppError, BRAND, type Envelope, exitCodeFor, renderCommand } from "@internal/core";
 import { COMMANDS, type Command, type FlagSpec, findCommand, unknownCommand } from "./commands.js";
-import { GLOBAL_FLAGS, resolveSettings, type Settings } from "./settings.js";
+import { GLOBAL_FLAGS, type HostSettings, resolveSettings, type Settings } from "./settings.js";
 import { renderText } from "./text.js";
 
 export interface RunResult {
@@ -11,32 +11,70 @@ export interface RunResult {
 }
 
 /** Runs one CLI invocation. Pure apart from the network: callers write stdout and set the exit code. */
-export async function run(argv: string[], vars: Record<string, string | undefined> = process.env): Promise<RunResult> {
-  let settings: Settings = resolveSettings({}, vars, 30);
+export async function run(
+  argv: string[],
+  vars: Record<string, string | undefined> = process.env,
+  host: HostSettings = {},
+): Promise<RunResult> {
+  const settingsFor = settingsWith(vars, host);
+  let settings: Settings = settingsFor({}, 30);
   let envelope: Envelope;
   try {
     const words = commandWords(argv);
     const wantsHelp = argv.includes("--help") || argv.includes("-h");
     const match = findCommand(words);
     if (words.length === 0 || (wantsHelp && !match)) {
-      settings = resolveSettings(globalFlags(argv), vars, 5);
+      settings = settingsFor(globalFlags(argv), 5);
       envelope = await helpFor([], settings);
     } else if (!match) {
       throw unknownCommand(words);
     } else if (wantsHelp) {
-      settings = resolveSettings(globalFlags(argv), vars, 5);
+      settings = settingsFor(globalFlags(argv), 5);
       envelope = await helpFor(match.command.path, settings);
     } else {
       const { command, consumed } = match;
       const parsed = parseCommandArgs(command, removeWords(argv, words.slice(0, consumed)));
-      settings = resolveSettings(parsed.values, vars, command.timeoutS);
+      settings = settingsFor(parsed.values, command.timeoutS);
       checkPositionals(command, parsed.positionals);
       envelope = await command.run({ settings, vars, positionals: parsed.positionals, flags: parsed.values });
     }
   } catch (err) {
     envelope = toErrorEnvelope(err);
   }
-  envelope = finalize(envelope, settings);
+  return finish(envelope, settings);
+}
+
+/**
+ * Runs one command from arguments that are already parsed: the same checks, code and envelope as run(), without
+ * node:util's parseArgs, which the Workers runtime doesn't have. The hosted MCP endpoint calls commands this way.
+ */
+export async function runCommand(
+  command: Command,
+  input: { positionals: string[]; flags: CommandFlags },
+  vars: Record<string, string | undefined>,
+  host: HostSettings = {},
+): Promise<RunResult> {
+  const settingsFor = settingsWith(vars, host);
+  let settings: Settings = settingsFor({}, 30);
+  let envelope: Envelope;
+  try {
+    settings = settingsFor(input.flags, command.timeoutS);
+    checkPositionals(command, input.positionals);
+    envelope = await command.run({ settings, vars, positionals: input.positionals, flags: input.flags });
+  } catch (err) {
+    envelope = toErrorEnvelope(err);
+  }
+  return finish(envelope, settings);
+}
+
+type CommandFlags = Record<string, string | boolean | string[] | undefined>;
+
+const settingsWith =
+  (vars: Record<string, string | undefined>, host: HostSettings) =>
+  (flags: CommandFlags, timeoutS: number): Settings => ({ ...resolveSettings(flags, vars, timeoutS), ...host });
+
+function finish(result: Envelope, settings: Settings): RunResult {
+  const envelope = finalize(result, settings);
   const stdout = settings.format === "text" ? renderText(envelope) : `${JSON.stringify(envelope, null, 2)}\n`;
   return { stdout, exitCode: exitCodeFor(envelope), envelope };
 }

@@ -1,8 +1,8 @@
 /**
  * printsi for Hermes Desktop: one pane that shows what the agent's printsi tools just did.
  *
- *   Preflight  the page drawn to scale (bleed, trim, safe area) with each issue marked where it is,
- *              and the fix for it.
+ *   Preflight  the page drawn to scale as the check describes it (bleed, trim or print area, safe
+ *              area, fold lines) with each issue marked where it is, and the fix for it.
  *   Order      where the order stands (quote, pay, print, ship, delivered), the price, and the button
  *              to review and pay.
  *
@@ -152,6 +152,31 @@ function envelopeOf(result) {
 const text = value => (typeof value === 'string' ? value : '')
 const number = value => (typeof value === 'number' && Number.isFinite(value) ? value : null)
 
+/** The page the file was checked against, in inches: `check.layout` from the API, or null from an older one. */
+function slimLayout(layout) {
+  const w = number(layout?.trim_in?.width)
+  const h = number(layout?.trim_in?.height)
+
+  if (!w || !h || w <= 0 || h <= 0) {
+    return null
+  }
+
+  const mm = [number(layout.trim_mm?.width), number(layout.trim_mm?.height)]
+
+  return {
+    w,
+    h,
+    mm: mm[0] && mm[1] ? mm : null,
+    bleed: Math.max(0, number(layout.bleed_in) ?? 0),
+    safe: Math.max(0, number(layout.safe_in) ?? 0),
+    folds: (Array.isArray(layout.folds) ? layout.folds : [])
+      .slice(0, 16)
+      .map(fold => ({ page: number(fold?.page) ?? 1, down: fold?.axis === 'y', at: number(fold?.at_in) }))
+      .filter(fold => fold.at !== null && fold.at > 0),
+    transparent: layout.background === 'transparent'
+  }
+}
+
 /** Keep only what the pane draws. Never the order token, the address lines, the phone or the email. */
 function slimCheck(check) {
   const options = check.spec?.options ?? {}
@@ -163,6 +188,10 @@ function slimCheck(check) {
     product: text(check.spec?.product),
     size: text(String(options.size ?? '')),
     sides: number(Number(options.sides)) ?? null,
+    fold: text(options.fold),
+    colour: text(options.colour),
+    print: text(options.print),
+    layout: slimLayout(check.layout),
     status: text(check.status),
     result: text(check.result),
     errors: number(check.counts?.error) ?? 0,
@@ -229,10 +258,20 @@ function slimOrder(order, purchase, previous) {
 // Small formatters
 // ---------------------------------------------------------------------------------------------------
 
-const PRODUCTS = { flyer: 'Flyers', poster: 'Posters', brochure: 'Brochures', 'business-card': 'Business cards' }
+const PRODUCTS = { flyer: 'Flyers', poster: 'Posters', brochure: 'Brochures', 'business-card': 'Business cards', postcard: 'Postcards', sticker: 'Stickers', letterhead: 'Letterhead', 'outdoor-poster': 'Outdoor posters', banner: 'Banners', calendar: 'Calendars', 'folded-card': 'Folded cards', canvas: 'Canvas prints', 'metal-print': 'Aluminium prints', 'acrylic-print': 'Acrylic prints', 'photo-tile': 'Photo tiles', mug: 'Mugs', bag: 'Bags', pillow: 'Pillows', 't-shirt': 'T-shirts', 'premium-t-shirt': 'Premium T-shirts', hoodie: 'Hoodies', sweatshirt: 'Sweatshirts' }
 const SIZES = { '8.5x11': 'US Letter', '5.5x8.5': 'Half Letter', a3: 'A3', a4: 'A4', a5: 'A5', '11x17': 'Tabloid' }
+const FOLDS = { half: 'half fold', trifold: 'tri-fold', z: 'Z-fold', gate: 'gate fold', w: 'W-fold', 'roll-4': 'roll fold' }
 const MM = 1 / 25.4
-const A_SIZES = { a3: [297 * MM, 420 * MM], a4: [210 * MM, 297 * MM], a5: [148.5 * MM, 210 * MM] }
+const A_SIZES = {
+  a2: [420 * MM, 594 * MM],
+  a3: [297 * MM, 420 * MM],
+  a4: [210 * MM, 297 * MM],
+  a5: [148.5 * MM, 210 * MM],
+  a6: [105 * MM, 148.5 * MM],
+  a7: [74 * MM, 105 * MM]
+}
+/** Flat paper products: without a layout from the API, their size and the usual bleed are enough to draw them. */
+const FLAT = new Set(['flyer', 'postcard', 'business-card', 'letterhead', 'sticker', 'poster'])
 
 const money = cents => (cents === null || cents === undefined ? '' : `$${(cents / 100).toFixed(2)}`)
 const ACRONYMS = /\b(rgb|cmyk|pdf|ppi|dpi|qr|icc)\b/gi
@@ -248,31 +287,67 @@ function day(iso) {
   return Number.isNaN(date.getTime()) ? '' : date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
 }
 
-/** Trim size, bleed and safe area in inches, from the size option (and the preview's shape, for orientation). */
+/** `l` -> `L`, `2xl` -> `2XL`, `a6` -> `A6`: a garment or paper size. Any other by its everyday name, or as it is. */
+const sizeName = size => SIZES[size] ?? (/^(\d?x{0,2}[sml]|\dxl|a\d)$/.test(size) ? size.toUpperCase() : size)
+const trimmed = value => String(Number(value.toFixed(2)))
+
+/**
+ * What to draw, in inches: the trim (or print area), bleed, safe area and fold lines.
+ *
+ * From the layout the check came with. A result without one (an older API) is drawn from its size when the product
+ * is a flat sheet, and otherwise as the page's outline alone (`known: false`): no bleed or safe line is invented,
+ * and no issue is placed, because nothing says how large the page is.
+ */
 function geometry(check) {
+  const layout = check.layout
+  const preview = check.preview?.width && check.preview?.height ? check.preview : null
+
+  if (layout) {
+    const [a, b, unit] = layout.mm ? [...layout.mm, 'mm'] : [layout.w, layout.h, 'in']
+
+    return scaled({ ...layout, area: layout.bleed === 0, label: `${trimmed(a)} × ${trimmed(b)} ${unit}` })
+  }
+
   const metric = A_SIZES[check.size]
-  const inches = /^(\d+(?:\.\d+)?)x(\d+(?:\.\d+)?)$/.exec(check.size)
-  let [w, h] = metric ?? (inches ? [Number(inches[1]), Number(inches[2])] : [8.5, 11])
-  const bleed = metric ? 3 * MM : 0.125
-  const safe = check.product === 'poster' ? 0.25 : bleed
-  const landscape = check.preview?.width && check.preview?.height && check.preview.width > check.preview.height
+  const sized = /^(\d+(?:\.\d+)?)x(\d+(?:\.\d+)?)(mm)?$/.exec(check.size)
+  const mm = Boolean(metric || sized?.[3])
 
-  if (landscape !== w > h && check.preview?.width) {
-    ;[w, h] = [h, w]
+  if (FLAT.has(check.product) && (metric || sized)) {
+    let [w, h] = metric ?? [Number(sized[1]) * (mm ? MM : 1), Number(sized[2]) * (mm ? MM : 1)]
+
+    if (preview && preview.width !== preview.height && preview.width > preview.height !== w > h) {
+      ;[w, h] = [h, w]
+    }
+
+    const bleed = mm ? 3 * MM : 0.125
+
+    return scaled({
+      w,
+      h,
+      bleed,
+      safe: check.product === 'poster' ? 0.25 : bleed,
+      folds: [],
+      transparent: false,
+      area: false,
+      label: mm ? `${trimmed(w / MM)} × ${trimmed(h / MM)} mm` : `${trimmed(w)} × ${trimmed(h)} in`
+    })
   }
 
-  const mm = value => Number((value / MM).toFixed(1))
-  // Drawn to scale, except that bleed and safe area are never thinner than 3% of the long side: at true scale a
-  // 3 mm margin on an A3 sheet is a hairline, and the three boxes would read as one.
-  const least = Math.max(w, h) * 0.03
+  // Nothing says how large the page is: its shape from the preview, or an upright sheet while the check runs.
+  const long = preview ? Math.max(preview.width, preview.height) : 11
+  const [w, h] = preview ? [preview.width / long, preview.height / long] : [8.5 / long, 1]
 
-  return {
-    w,
-    h,
-    bleed: Math.max(bleed, least),
-    safe: Math.max(safe, least),
-    label: metric ? `${mm(w)} × ${mm(h)} mm` : `${w} × ${h} in`
-  }
+  return { w: w * 10, h: h * 10, bleed: 0, safe: 0, drawnBleed: 0, drawnSafe: 0, folds: [], transparent: false, area: false, known: false, label: '' }
+}
+
+/**
+ * Drawn to scale, except that a bleed or safe area is never thinner than 3% of the long side: at true scale a 3 mm
+ * margin on an A3 sheet is a hairline, and the three boxes would read as one. One that is zero is not drawn.
+ */
+function scaled(g) {
+  const least = Math.max(g.w, g.h) * 0.03
+
+  return { ...g, known: true, drawnBleed: g.bleed > 0 ? Math.max(g.bleed, least) : 0, drawnSafe: g.safe > 0 ? Math.max(g.safe, least) : 0 }
 }
 
 /** Only ever open printsi's own payment pages. */
@@ -354,52 +429,116 @@ function verdict(check) {
   }
 }
 
-/** The page to scale: bleed (dashed), trim (solid), safe area (dotted) and each issue where it sits. */
+const DASH = { bleed: '4 3', safe: '1 3', fold: '7 3 1 3' }
+
+/**
+ * The page to scale: bleed (dashed), trim or print area (solid), safe area (dotted), fold lines (dash-dot) and each
+ * issue where it sits. A garment's page is chequered: it is transparent, and only the design is printed.
+ */
 function PageDiagram({ check, page, active, onHover }) {
   const g = geometry(check)
-  const W = g.w + g.bleed * 2
-  const H = g.h + g.bleed * 2
+  const W = g.w + g.drawnBleed * 2
+  const H = g.h + g.drawnBleed * 2
   const pad = Math.max(W, H) * 0.04
   const unit = Math.max(W, H) / 100
   const passed = check.result === 'pass' && check.status === 'complete'
+  // An issue's place is in inches from the trim: without the page's size there is nowhere to put it.
   const marked = check.issues
     .map((issue, index) => ({ issue, index }))
-    .filter(({ issue }) => issue.region && (issue.page ?? 1) === page)
+    .filter(({ issue }) => g.known && issue.region && (issue.page ?? 1) === page)
+  const folds = g.folds.filter(fold => fold.page === page)
   const stroke = { vectorEffect: 'non-scaling-stroke', fill: 'none' }
+  const chequer = `printsi-clear-${String(check.id).replace(/[^\w-]/g, '')}`
+  const cell = unit * 3
+  const parts = [g.label, g.area ? 'print area' : '', g.transparent ? 'transparent background' : '', folds.length ? `${folds.length} fold ${folds.length === 1 ? 'line' : 'lines'}` : '']
+  // Each issue's number sits at the top-left of its region. Two regions that start at the same corner (text too
+  // close to the top edge and to the left edge) would stack their numbers: the later one moves along its region.
+  const radius = unit * 3.4
+  const numbers = []
+  const numberAt = (x, y, w, h) => {
+    let at = [x + unit * 5, y + unit * 5]
+
+    for (let tries = 0; tries < 12 && numbers.some(other => Math.hypot(other[0] - at[0], other[1] - at[1]) < radius * 2.2); tries++) {
+      at = w >= h ? [at[0] + radius * 2.4, at[1]] : [at[0], at[1] + radius * 2.4]
+    }
+
+    numbers.push(at)
+
+    return at
+  }
 
   return jsxs('svg', {
     viewBox: `${-pad} ${-pad} ${W + pad * 2} ${H + pad * 2}`,
     role: 'img',
-    'aria-label': `Page ${page}, ${g.label}, with ${marked.length} marked ${marked.length === 1 ? 'issue' : 'issues'}`,
+    'aria-label': `Page ${page}, ${parts.filter(Boolean).join(', ')}, with ${marked.length} marked ${marked.length === 1 ? 'issue' : 'issues'}`,
     style: { display: 'block', width: '100%', maxHeight: 264, margin: '0 auto' },
     children: [
-      jsx('rect', { x: 0, y: 0, width: W, height: H, stroke: C.ghost, strokeWidth: 1, strokeDasharray: '4 3', ...stroke }),
+      g.transparent
+        ? jsx('defs', {
+            children: jsxs('pattern', {
+              id: chequer,
+              x: g.drawnBleed,
+              y: g.drawnBleed,
+              width: cell * 2,
+              height: cell * 2,
+              patternUnits: 'userSpaceOnUse',
+              children: [
+                jsx('rect', { width: cell * 2, height: cell * 2, fill: C.card }),
+                jsx('rect', { width: cell, height: cell, fill: tint(C.ghost, 28) }),
+                jsx('rect', { x: cell, y: cell, width: cell, height: cell, fill: tint(C.ghost, 28) })
+              ]
+            })
+          })
+        : null,
+      g.drawnBleed > 0
+        ? jsx('rect', { x: 0, y: 0, width: W, height: H, stroke: C.ghost, strokeWidth: 1, strokeDasharray: DASH.bleed, ...stroke })
+        : null,
       jsx('rect', {
-        x: g.bleed,
-        y: g.bleed,
+        x: g.drawnBleed,
+        y: g.drawnBleed,
         width: g.w,
         height: g.h,
         vectorEffect: 'non-scaling-stroke',
-        fill: passed ? tint(C.good, 7) : C.card,
+        fill: g.transparent ? `url(#${chequer})` : passed ? tint(C.good, 7) : C.card,
         stroke: passed ? C.good : C.soft,
         strokeWidth: 1.25
       }),
-      jsx('rect', {
-        x: g.bleed + g.safe,
-        y: g.bleed + g.safe,
-        width: Math.max(0, g.w - g.safe * 2),
-        height: Math.max(0, g.h - g.safe * 2),
-        stroke: C.ghost,
-        strokeWidth: 1,
-        strokeDasharray: '1 3',
-        ...stroke
-      }),
+      g.drawnSafe > 0
+        ? jsx('rect', {
+            x: g.drawnBleed + g.drawnSafe,
+            y: g.drawnBleed + g.drawnSafe,
+            width: Math.max(0, g.w - g.drawnSafe * 2),
+            height: Math.max(0, g.h - g.drawnSafe * 2),
+            stroke: C.ghost,
+            strokeWidth: 1,
+            strokeDasharray: DASH.safe,
+            ...stroke
+          })
+        : null,
+      // A fold runs the whole page, through the bleed, as the sheet is folded after it is cut.
+      ...folds.map((fold, index) =>
+        jsx(
+          'line',
+          {
+            x1: fold.down ? 0 : g.drawnBleed + fold.at,
+            y1: fold.down ? g.drawnBleed + fold.at : 0,
+            x2: fold.down ? W : g.drawnBleed + fold.at,
+            y2: fold.down ? g.drawnBleed + fold.at : H,
+            stroke: C.faint,
+            strokeWidth: 1,
+            strokeDasharray: DASH.fold,
+            ...stroke
+          },
+          `fold-${index}`
+        )
+      ),
       ...marked.map(({ issue, index }) => {
         const color = tone(issue.severity)
-        const x = Math.min(Math.max(g.bleed + issue.region.x, 0), W)
-        const y = Math.min(Math.max(g.bleed + issue.region.y, 0), H)
+        const x = Math.min(Math.max(g.drawnBleed + issue.region.x, 0), W)
+        const y = Math.min(Math.max(g.drawnBleed + issue.region.y, 0), H)
         const w = Math.min(issue.region.w, W - x)
         const h = Math.min(issue.region.h, H - y)
+        const [cx, cy] = numberAt(x, y, w, h)
         const on = active === index
 
         return jsxs(
@@ -421,10 +560,10 @@ function PageDiagram({ check, page, active, onHover }) {
                 strokeWidth: on ? 2 : 1.25,
                 style: { transition: 'fill 120ms ease' }
               }),
-              jsx('circle', { cx: x + unit * 5, cy: y + unit * 5, r: unit * 3.4, fill: color }),
+              jsx('circle', { cx, cy, r: radius, fill: color }),
               jsx('text', {
-                x: x + unit * 5,
-                y: y + unit * 5,
+                x: cx,
+                y: cy,
                 textAnchor: 'middle',
                 dominantBaseline: 'central',
                 fontSize: unit * 4.2,
@@ -451,7 +590,9 @@ function PageDiagram({ check, page, active, onHover }) {
   })
 }
 
-function Legend({ label, page, pages, onPage }) {
+function Legend({ g, page, pages, onPage }) {
+  // A folded sheet's two pages are its two sides.
+  const side = g.folds.length > 0 && pages === 2 ? ` · ${page === 1 ? 'outside' : 'inside'}` : ''
   const swatch = dash =>
     jsx('svg', {
       width: 16,
@@ -485,13 +626,21 @@ function Legend({ label, page, pages, onPage }) {
       pages > 1
         ? jsxs('div', {
             style: { display: 'inline-flex', alignItems: 'center', gap: 2, color: C.soft, fontSize: 11 },
-            children: [turn(page - 1, '‹', 'Previous page'), `Page ${page} of ${pages}`, turn(page + 1, '›', 'Next page')]
+            children: [turn(page - 1, '‹', 'Previous page'), `Page ${page} of ${pages}${side}`, turn(page + 1, '›', 'Next page')]
           })
         : null,
-      jsxs('div', {
-        style: { display: 'flex', justifyContent: 'center', gap: 12, flexWrap: 'wrap' },
-        children: [item('4 3', 'bleed'), item('', 'trim'), item('1 3', 'safe'), jsx('span', { style: { color: C.ghost }, children: label })]
-      })
+      g.known
+        ? jsxs('div', {
+            style: { display: 'flex', justifyContent: 'center', gap: 12, flexWrap: 'wrap' },
+            children: [
+              g.drawnBleed > 0 ? item(DASH.bleed, 'bleed') : null,
+              item('', g.area ? 'print area' : 'trim'),
+              g.drawnSafe > 0 ? item(DASH.safe, 'safe') : null,
+              g.folds.length > 0 ? item(DASH.fold, 'fold') : null,
+              jsx('span', { style: { color: C.ghost }, children: g.transparent ? `${g.label} · transparent` : g.label })
+            ]
+          })
+        : null
     ]
   })
 }
@@ -549,7 +698,14 @@ function Preflight({ check }) {
   const pages = Math.max(1, check.pages)
   const [page, setPage] = useState(() => check.issues.find(issue => issue.region)?.page ?? 1)
   const v = verdict(check)
-  const spec = [PRODUCTS[check.product] ?? sentence(check.product), SIZES[check.size] ?? check.size, check.sides ? `${check.sides}-sided` : '']
+  const g = geometry(check)
+  // What was chosen: a fold, a colour and where a garment is printed say more than the number of sides.
+  const chosen = [FOLDS[check.fold] ?? check.fold, check.colour, check.print].filter(Boolean)
+  const spec = [
+    PRODUCTS[check.product] ?? sentence(check.product),
+    sizeName(check.size),
+    ...(chosen.length > 0 ? chosen : [check.sides ? `${check.sides}-sided` : ''])
+  ]
     .filter(Boolean)
     .join(' · ')
 
@@ -577,7 +733,7 @@ function Preflight({ check }) {
         ]
       }),
       jsx('div', { style: { marginTop: 16 }, children: jsx(PageDiagram, { check, page, active, onHover: setActive }) }),
-      jsx(Legend, { label: geometry(check).label, page, pages, onPage: setPage }),
+      jsx(Legend, { g, page, pages, onPage: setPage }),
       check.issues.length > 0
         ? jsx('ol', {
             style: { listStyle: 'none', margin: '12px 0 0', padding: 0 },
@@ -698,7 +854,7 @@ function Order({ order, os }) {
   const quote = order.quote
   const total = quote?.display || money(order.payAmount ?? quote?.total)
   const link = order.status === 'awaiting_approval' ? payLink(order.payUrl) : null
-  const title = [order.quantity ? `${order.quantity} ×` : '', PRODUCTS[order.product] ?? sentence(order.product), SIZES[order.size] ?? order.size]
+  const title = [order.quantity ? `${order.quantity} ×` : '', PRODUCTS[order.product] ?? sentence(order.product), sizeName(order.size)]
     .filter(Boolean)
     .join(' ')
   const arrives = quote?.earliest && quote?.latest ? `${day(quote.earliest)} – ${day(quote.latest)}` : ''
@@ -847,6 +1003,10 @@ export default {
       product: text(args?.product),
       size: text(String(args?.size ?? '')).toLowerCase(),
       sides: null,
+      fold: '',
+      colour: '',
+      print: '',
+      layout: null,
       status: 'running',
       result: '',
       errors: 0,

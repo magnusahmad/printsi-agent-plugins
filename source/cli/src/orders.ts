@@ -3,7 +3,7 @@ import { resolve } from "node:path";
 import { AppError, BRAND, type Envelope, type NextAction, type Warning } from "@internal/core";
 import { parseUsd } from "@internal/core/pricing";
 import { waitReached } from "@internal/core/progress";
-import { expectOk, inspectLocalFile, uploadFile } from "./check.js";
+import { expectOk, prepareFile } from "./check.js";
 import { configDir, loadGuest, loadOrderTokens, orderTokensFromEnv, saveOrderToken } from "./credentials.js";
 import { apiRequest } from "./http.js";
 import { withCredential } from "./session.js";
@@ -46,11 +46,10 @@ export async function orderCreate(
   const shipTo = await parseShipTo(
     requireString(flags, "ship-to", "--ship-to is required: a JSON file, inline JSON, or - for stdin."),
   );
-  const path = resolve(file);
-  const local = await inspectLocalFile(path);
+  const upload = await prepareFile(settings, file, deadline);
 
   return withCredential(settings, vars, async (warnings) => {
-    const fileId = await uploadFile(settings, path, local, deadline);
+    const fileId = await upload();
     const created = await expectOk(
       await apiRequest(settings, {
         method: "POST",
@@ -102,9 +101,8 @@ export async function orderUpdate(
   if (typeof flags.product === "string" || Object.keys(options).length > 0) {
     body.spec = { ...(typeof flags.product === "string" && { product: flags.product }), options };
   }
-  const filePath = typeof flags.file === "string" ? resolve(flags.file) : null;
-  const local = filePath ? await inspectLocalFile(filePath) : null;
-  if (Object.keys(body).length === 0 && !filePath) {
+  const upload = typeof flags.file === "string" ? await prepareFile(settings, flags.file, deadline) : null;
+  if (Object.keys(body).length === 0 && !upload) {
     throw new AppError(
       "usage",
       "NOTHING_TO_UPDATE",
@@ -112,7 +110,7 @@ export async function orderUpdate(
     );
   }
   return withOrderCredential(settings, vars, id, async () => {
-    if (filePath && local) body.file_id = await uploadFile(settings, filePath, local, deadline);
+    if (upload) body.file_id = await upload();
     const updated = await expectOk(
       await apiRequest(settings, { method: "PATCH", path: `/v1/orders/${id}`, json: body, deadline }),
     );

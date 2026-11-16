@@ -2,17 +2,21 @@
 # Turn an HTML design into a print-ready PDF: exact trim size plus bleed on every side, CMYK colour, text converted to
 # outlines, TrimBox and BleedBox set. Printers ask for exactly this.
 #
-#   print-ready.sh <design.html> <out.pdf> <trim-width-mm> <trim-height-mm> [bleed-mm]
+#   print-ready.sh <design.html> <out.pdf> <trim-width-mm> <trim-height-mm> [bleed-mm] [cmyk|rgb]
 #
 # The HTML must draw a page of (trim + 2 × bleed) in each direction, e.g. for US Letter with 0.125 in (3.175 mm) bleed:
 #   @page { size: 8.75in 11.25in; margin: 0 }   with backgrounds running to the page edge and text kept at least
-#   (bleed + safe margin) from it.
+#   (bleed + safe margin) from it. One page element per PDF page; every page gets the same boxes.
+#
+# The last argument is the colour of the PDF: `cmyk` (the default, for everything printed on paper, board, vinyl,
+# canvas, mugs and bags) or `rgb` for garments, which are printed direct-to-garment from RGB with white ink, so the
+# colours are left as designed. A page with no background stays transparent either way.
 #
 # Needs Google Chrome or Chromium (rendering) and Ghostscript `gs` (CMYK and outlines). Runs locally; no network.
 set -eu
 
 if [ "$#" -lt 4 ]; then
-  echo "usage: print-ready.sh <design.html> <out.pdf> <trim-width-mm> <trim-height-mm> [bleed-mm]" >&2
+  echo "usage: print-ready.sh <design.html> <out.pdf> <trim-width-mm> <trim-height-mm> [bleed-mm] [cmyk|rgb]" >&2
   exit 2
 fi
 html=$1
@@ -20,6 +24,12 @@ out=$2
 trim_w=$3
 trim_h=$4
 bleed=${5:-3}
+colour=${6:-cmyk}
+case $colour in
+  cmyk) label=CMYK ;;
+  rgb) label=RGB ;;
+  *) echo "The colour must be cmyk or rgb, not: $colour" >&2; exit 2 ;;
+esac
 
 [ -f "$html" ] || { echo "No such file: $html" >&2; exit 2; }
 command -v gs >/dev/null 2>&1 || { echo "Ghostscript (gs) is required: brew install ghostscript / apt install ghostscript" >&2; exit 3; }
@@ -51,9 +61,15 @@ boxes=$(awk -v w="$trim_w" -v h="$trim_h" -v b="$bleed" 'BEGIN {
   printf "<< /EndPage { exch pop 0 eq { [/TrimBox [%.4f %.4f %.4f %.4f] /BleedBox [0 0 %.4f %.4f] /PAGE pdfmark true } { false } ifelse } bind >> setpagedevice", B, B, W - B, H - B, W, H
 }')
 
-# 3. CMYK, outlined text, boxes. The page-device setup must come before the input file.
-gs -q -o "$out" -sDEVICE=pdfwrite -dNoOutputFonts \
-  -sColorConversionStrategy=CMYK -sProcessColorModel=DeviceCMYK -dAutoRotatePages=/None \
-  -c "$boxes" -f "$tmp/rgb.pdf"
+# 3. Colour, outlined text, boxes. The page-device setup must come before the input file.
+if [ "$colour" = rgb ]; then
+  gs -q -o "$out" -sDEVICE=pdfwrite -dNoOutputFonts \
+    -sColorConversionStrategy=LeaveColorUnchanged -dAutoRotatePages=/None \
+    -c "$boxes" -f "$tmp/rgb.pdf"
+else
+  gs -q -o "$out" -sDEVICE=pdfwrite -dNoOutputFonts \
+    -sColorConversionStrategy=CMYK -sProcessColorModel=DeviceCMYK -dAutoRotatePages=/None \
+    -c "$boxes" -f "$tmp/rgb.pdf"
+fi
 
-echo "$out: trim ${trim_w}×${trim_h} mm, bleed ${bleed} mm, page $(awk -v w="$trim_w" -v h="$trim_h" -v b="$bleed" 'BEGIN{printf "%g×%g", w+2*b, h+2*b}') mm, CMYK, text outlined"
+echo "$out: trim ${trim_w}×${trim_h} mm, bleed ${bleed} mm, page $(awk -v w="$trim_w" -v h="$trim_h" -v b="$bleed" 'BEGIN{printf "%g×%g", w+2*b, h+2*b}') mm, $label, text outlined"

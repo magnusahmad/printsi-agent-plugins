@@ -22,6 +22,19 @@ export function renderCommand(op: string, args: Record<string, unknown> = {}, bi
   return parts.map(shellQuote).join(" ");
 }
 
+/** Product options the CLI takes as flags of their own; any other option goes through `--option key=value`. */
+const OPTION_FLAGS = new Set(["size", "stock", "finish", "sides", "fold", "orientation"]);
+
+/** Product options as command arguments every CLI version accepts (spec 01 §7.5). */
+export function optionArgs(options: Record<string, string | number>): Record<string, unknown> {
+  const named = Object.entries(options).filter(([key]) => OPTION_FLAGS.has(key));
+  const others = Object.entries(options).filter(([key]) => !OPTION_FLAGS.has(key));
+  return {
+    ...Object.fromEntries(named),
+    ...(others.length > 0 && { option: others.map(([key, value]) => `${key}=${value}`) }),
+  };
+}
+
 function shellQuote(s: string): string {
   if (s === "") return "''";
   return /^[\w@%+=:,./-]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`;

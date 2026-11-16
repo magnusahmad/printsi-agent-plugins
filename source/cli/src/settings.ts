@@ -38,7 +38,14 @@ export interface Settings {
   harness: string;
   /** Whether to pass on "a newer CLI is available" notices; off in MCP mode. */
   updateNotices: boolean;
+  /** How to reach the API, when a host runs the commands in-process (the hosted MCP endpoint). Default: global fetch. */
+  fetch?: typeof fetch;
+  /** Client header to send instead of the CLI's own, for such a host. */
+  client?: string;
 }
+
+/** What a host that runs commands in-process sets on every command's settings. */
+export type HostSettings = Pick<Settings, "fetch" | "client">;
 
 type Flags = Record<string, string | boolean | string[] | undefined>;
 type EnvVars = Record<string, string | undefined>;

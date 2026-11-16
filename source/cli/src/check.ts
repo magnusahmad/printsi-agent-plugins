@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { mkdir, open, stat, writeFile } from "node:fs/promises";
@@ -33,21 +34,34 @@ export async function runCheck(
   input: CheckInput,
 ): Promise<Envelope> {
   const deadline = Date.now() + settings.timeoutMs;
-  const path = resolve(input.file);
+  const upload = await prepareFile(settings, input.file, deadline);
+  return withCredential(settings, vars, async (warnings) =>
+    checkUploaded(settings, input, await upload(), deadline, warnings),
+  );
+}
+
+/** A file the API already holds. Accepted wherever a PDF path is, so a file is never sent twice. */
+export const isFileId = (value: string) => /^fil_[0-9A-HJKMNP-TV-Z]{26}$/.test(value);
+
+/**
+ * Turns a PDF argument into its upload step. A path is inspected now (so a bad file fails before any credential is
+ * made) and uploaded when the step runs; a file id (fil_…) is used as it is.
+ */
+export async function prepareFile(settings: Settings, value: string, deadline: number): Promise<() => Promise<string>> {
+  if (isFileId(value)) return async () => value;
+  const path = resolve(value);
   const local = await inspectLocalFile(path);
-  return withCredential(settings, vars, (warnings) => checkUploaded(settings, input, path, local, deadline, warnings));
+  return () => uploadFile(settings, path, local, deadline);
 }
 
 async function checkUploaded(
   settings: Settings,
   input: CheckInput,
-  path: string,
-  { bytes, sha256 }: { bytes: number; sha256: string },
+  fileId: string,
   deadline: number,
   initialWarnings: Warning[],
 ): Promise<Envelope> {
   const warnings = [...initialWarnings];
-  const fileId = await uploadFile(settings, path, { bytes, sha256 }, deadline);
 
   let envelope = await expectOk(
     await apiRequest(settings, {
@@ -120,33 +134,54 @@ async function checkUploaded(
 }
 
 /** Uploads a local PDF unless the server already holds identical bytes for this principal; returns the file id. */
-export async function uploadFile(
+export function uploadFile(
   settings: Settings,
   path: string,
   { bytes, sha256 }: { bytes: number; sha256: string },
+  deadline: number,
+): Promise<string> {
+  return upload(
+    settings,
+    { name: basename(path), bytes, sha256 },
+    () => Readable.toWeb(createReadStream(path)) as unknown as ReadableStream,
+    deadline,
+  );
+}
+
+/** The same for a PDF already in memory (the hosted MCP endpoint, which is given a URL instead of a path). */
+export async function uploadBytes(
+  settings: Settings,
+  name: string,
+  pdf: Uint8Array,
+  deadline: number,
+): Promise<string> {
+  if (pdf.length > MAX_BYTES) throw tooLarge(name, pdf.length);
+  if (!Buffer.from(pdf.buffer, pdf.byteOffset, Math.min(pdf.length, 1024)).includes("%PDF-")) throw notPdf(name);
+  const sha256 = createHash("sha256").update(pdf).digest("hex");
+  return upload(settings, { name, bytes: pdf.length, sha256 }, () => pdf as unknown as RequestInit["body"], deadline);
+}
+
+async function upload(
+  settings: Settings,
+  { name, bytes, sha256 }: { name: string; bytes: number; sha256: string },
+  body: () => RequestInit["body"],
   deadline: number,
 ): Promise<string> {
   const created = await expectOk(
     await apiRequest(settings, {
       method: "POST",
       path: "/v1/files",
-      json: { name: basename(path), bytes, sha256, content_type: "application/pdf", purpose: "artwork" },
+      json: { name, bytes, sha256, content_type: "application/pdf", purpose: "artwork" },
       deadline,
     }),
   );
-  const { file, upload } = created.data as {
+  const { file, upload: target } = created.data as {
     file: { id: string };
     upload: { url: string; method: "PUT"; headers: Record<string, string> } | null;
   };
-  if (upload) {
+  if (target) {
     await expectOk(
-      await apiRequest(settings, {
-        method: upload.method,
-        path: upload.url,
-        headers: upload.headers,
-        body: () => Readable.toWeb(createReadStream(path)) as unknown as ReadableStream,
-        deadline,
-      }),
+      await apiRequest(settings, { method: target.method, path: target.url, headers: target.headers, body, deadline }),
     );
   }
   return file.id;
@@ -161,17 +196,7 @@ export async function inspectLocalFile(path: string): Promise<{ bytes: number; s
   } catch {
     throw new AppError("invalid_request", "FILE_NOT_FOUND", `No file at ${path}.`, { param: "pdf" });
   }
-  if (size > MAX_BYTES) {
-    throw new AppError(
-      "invalid_request",
-      "FILE_TOO_LARGE",
-      `${basename(path)} is ${(size / 1024 / 1024).toFixed(1)} MB; the limit is ${MAX_BYTES / 1024 / 1024} MB.`,
-      {
-        param: "pdf",
-        details: { bytes: size, max_bytes: MAX_BYTES },
-      },
-    );
-  }
+  if (size > MAX_BYTES) throw tooLarge(basename(path), size);
   // PDF readers accept the header anywhere in the first 1024 bytes.
   const handle = await open(path, "r");
   const head = Buffer.alloc(1024);
@@ -180,17 +205,28 @@ export async function inspectLocalFile(path: string): Promise<{ bytes: number; s
   } finally {
     await handle.close();
   }
-  if (!head.includes("%PDF-")) {
-    throw new AppError(
-      "invalid_request",
-      "NOT_PDF",
-      `${basename(path)} isn't a PDF. Only print-ready PDFs are accepted: export or convert the design to PDF first, with 0.125 in bleed (see \`${BRAND.name} products show <product>\` for exact sizes).`,
-      { param: "pdf" },
-    );
-  }
+  if (!head.includes("%PDF-")) throw notPdf(basename(path));
   const hash = createHash("sha256");
   for await (const chunk of createReadStream(path)) hash.update(chunk as Buffer);
   return { bytes: size, sha256: hash.digest("hex") };
+}
+
+function tooLarge(name: string, size: number): AppError {
+  return new AppError(
+    "invalid_request",
+    "FILE_TOO_LARGE",
+    `${name} is ${(size / 1024 / 1024).toFixed(1)} MB; the limit is ${MAX_BYTES / 1024 / 1024} MB.`,
+    { param: "pdf", details: { bytes: size, max_bytes: MAX_BYTES } },
+  );
+}
+
+function notPdf(name: string): AppError {
+  return new AppError(
+    "invalid_request",
+    "NOT_PDF",
+    `${name} isn't a PDF. Only print-ready PDFs are accepted: export or convert the design to PDF first, with 0.125 in bleed (see \`${BRAND.name} products show <product>\` for exact sizes).`,
+    { param: "pdf" },
+  );
 }
 
 export async function expectOk(envelope: Envelope): Promise<Envelope & { ok: true }> {
